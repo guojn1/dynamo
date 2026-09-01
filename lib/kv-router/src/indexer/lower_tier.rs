@@ -253,24 +253,39 @@ impl LowerTierIndexer {
         worker: WorkerWithDpRank,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
-        let remove_worker_entry = {
+        let (remove_worker_entry, missing_blocks) = {
             let Some(worker_map) = worker_blocks.get_mut(&worker) else {
-                return Err(KvCacheEventError::BlockNotFound);
+                tracing::debug!(
+                    worker = ?worker,
+                    requested_blocks = block_hashes.len(),
+                    "Ignoring duplicate lower-tier Remove for unknown worker"
+                );
+                return Ok(());
             };
 
+            let mut missing_blocks = 0;
             for block_hash in block_hashes {
-                let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
-                };
-
-                self.remove_worker_from_edge(key, worker);
+                if let Some(key) = worker_map.remove(block_hash) {
+                    self.remove_worker_from_edge(key, worker);
+                } else {
+                    missing_blocks += 1;
+                }
             }
 
-            worker_map.is_empty()
+            (worker_map.is_empty(), missing_blocks)
         };
 
         if remove_worker_entry {
             worker_blocks.remove(&worker);
+        }
+
+        if missing_blocks > 0 {
+            tracing::debug!(
+                worker = ?worker,
+                missing_blocks,
+                requested_blocks = block_hashes.len(),
+                "Ignored duplicate lower-tier Remove blocks"
+            );
         }
 
         Ok(())
@@ -1160,6 +1175,61 @@ mod tests {
             after_one_remove.get(&WorkerWithDpRank::new(13, 0)),
             Some(&0)
         );
+    }
+
+    #[test]
+    fn duplicate_remove_is_idempotent_and_continues_remaining_blocks() {
+        let mut index = TestLowerTierIndex::new();
+        let worker = WorkerWithDpRank::new(13, 0);
+        index
+            .apply_event(store_event(
+                worker.worker_id,
+                worker.dp_rank,
+                0,
+                Some(800),
+                &[61, 62],
+                &[601, 602],
+            ))
+            .unwrap();
+
+        index
+            .apply_event(remove_event(
+                worker.worker_id,
+                1,
+                worker.dp_rank,
+                vec![ExternalSequenceBlockHash(601)],
+            ))
+            .unwrap();
+        index
+            .apply_event(remove_event(
+                worker.worker_id,
+                2,
+                worker.dp_rank,
+                vec![
+                    ExternalSequenceBlockHash(601),
+                    ExternalSequenceBlockHash(602),
+                ],
+            ))
+            .unwrap();
+        index
+            .apply_event(remove_event(
+                worker.worker_id,
+                3,
+                worker.dp_rank,
+                vec![
+                    ExternalSequenceBlockHash(601),
+                    ExternalSequenceBlockHash(602),
+                ],
+            ))
+            .unwrap();
+
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            worker,
+            LowerTierContinuation::new(1, ExternalSequenceBlockHash(601)),
+        );
+        let hits = index.query_contiguous_hits(&local_hashes(&[61, 62]), &continuations);
+        assert_eq!(hits.get(&worker), Some(&0));
     }
 
     #[test]
