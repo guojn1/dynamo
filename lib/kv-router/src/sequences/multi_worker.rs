@@ -12,13 +12,14 @@
 use dynamo_tokens::SequenceHash;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::RandomState};
 use std::future::Future;
-use std::sync::Arc;
+use std::hash::BuildHasher;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +40,7 @@ use crate::protocols::{
 // in ActiveSequencesMultiWorker::force_expire_requests_across_all_workers for
 // more details.
 const FORCE_EXPIRE_REQUESTS_ACROSS_ALL_WORKERS_INTERVAL: Duration = Duration::from_secs(60);
+const REPLICA_EVENT_PUBLISH_SHARDS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Traits
@@ -163,6 +165,8 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     block_size: usize,
     pub(super) router_id: u64,
     pub(super) publisher: Arc<P>,
+    replica_event_txs: OnceLock<Vec<mpsc::UnboundedSender<ActiveSequenceEvent>>>,
+    replica_event_hasher: RandomState,
     remote_state_updates: watch::Sender<()>,
     #[cfg(test)]
     remote_state_update_count: AtomicUsize,
@@ -271,6 +275,8 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             block_size,
             router_id,
             publisher,
+            replica_event_txs: OnceLock::new(),
+            replica_event_hasher: RandomState::new(),
             remote_state_updates,
             #[cfg(test)]
             remote_state_update_count: AtomicUsize::new(0),
@@ -364,23 +370,49 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         }
     }
 
-    fn spawn_publish_event(&self, event: ActiveSequenceEvent) {
+    fn enqueue_publish_event(&self, event: ActiveSequenceEvent) {
         if !self.replica_sync {
             return;
         }
 
-        // TODO: Publish explicit prompt-load decay timestamps with these events so peer routers
-        // can mirror the same oldest-prefill anchor instead of approximating from receive time.
-        let publisher = Arc::clone(&self.publisher);
-        tokio::spawn(async move {
-            if let Err(e) = publisher.publish_event(&event).await {
-                tracing::error!(
-                    request_id = %event.request_id,
-                    worker = ?event.worker,
-                    "failed to publish active sequence event: {e}"
-                );
-            }
+        // A request's Add/Mark/Free events must reach the transport in mutation order. The
+        // fixed shards preserve per-request order without serializing unrelated requests.
+        // Spawning one task per event allowed a slow Add publish to be overtaken by Free,
+        // leaving peer routers with a resurrected request until expiry.
+        let txs = self.replica_event_txs.get_or_init(|| {
+            (0..REPLICA_EVENT_PUBLISH_SHARDS)
+                .map(|_| {
+                    let (tx, mut rx) = mpsc::unbounded_channel::<ActiveSequenceEvent>();
+                    let publisher = Arc::clone(&self.publisher);
+                    tokio::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            // TODO: Publish explicit prompt-load decay timestamps with these
+                            // events so peer routers can mirror the same oldest-prefill anchor
+                            // instead of approximating from receive time.
+                            if let Err(error) = publisher.publish_event(&event).await {
+                                tracing::error!(
+                                    request_id = %event.request_id,
+                                    worker = ?event.worker,
+                                    "failed to publish active sequence event: {error}"
+                                );
+                            }
+                        }
+                    });
+                    tx
+                })
+                .collect()
         });
+        let shard = self.replica_event_hasher.hash_one(&event.request_id) as usize
+            % REPLICA_EVENT_PUBLISH_SHARDS;
+
+        if let Err(error) = txs[shard].send(event) {
+            let event = error.0;
+            tracing::error!(
+                request_id = %event.request_id,
+                worker = ?event.worker,
+                "replica-sync event publisher task exited"
+            );
+        }
     }
 
     /// Subscribe to remote lifecycle updates that were applied through replica sync.
@@ -538,7 +570,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         });
         self.add_request_local(req, decay_now, lazily_register_worker)?;
         if let Some(event) = event {
-            self.spawn_publish_event(event);
+            self.enqueue_publish_event(event);
         }
         Ok(())
     }
@@ -1037,7 +1069,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             mutate_fn,
             remove_mapping,
         )?;
-        self.spawn_publish_event(ActiveSequenceEvent {
+        self.enqueue_publish_event(ActiveSequenceEvent {
             request_id: request_id.clone(),
             worker,
             data: event_data,
@@ -1062,7 +1094,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
 
         let lora_name = self.request_index.lora_for(request_id);
         self.mutate_request_worker_load_state_local(worker, request_id, decay_now, mutate_fn)?;
-        self.spawn_publish_event(ActiveSequenceEvent {
+        self.enqueue_publish_event(ActiveSequenceEvent {
             request_id: request_id.clone(),
             worker,
             data: event_data,
@@ -1078,10 +1110,11 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::future::{self, Future};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use rustc_hash::FxHashMap;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Notify, mpsc};
 
     use super::*;
     use crate::protocols::{
@@ -1332,6 +1365,53 @@ mod tests {
 
         fn observe_worker_removed(&self, worker: &WorkerWithDpRank, _worker_type: &str) {
             self.state.removed.lock().unwrap().push(*worker);
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingAddPublisherState {
+        add_started: Notify,
+        release_add: Notify,
+        free_started: AtomicBool,
+        published: Mutex<Vec<&'static str>>,
+    }
+
+    struct BlockingAddPublisher {
+        state: Arc<BlockingAddPublisherState>,
+    }
+
+    impl SequencePublisher for BlockingAddPublisher {
+        fn publish_event(
+            &self,
+            event: &ActiveSequenceEvent,
+        ) -> impl Future<Output = anyhow::Result<()>> + Send {
+            let state = Arc::clone(&self.state);
+            let event_kind = match event.data {
+                ActiveSequenceEventData::AddRequest { .. } => "add",
+                ActiveSequenceEventData::MarkPrefillCompleted => "mark",
+                ActiveSequenceEventData::Free => "free",
+            };
+            async move {
+                if event_kind == "add" {
+                    state.add_started.notify_one();
+                    state.release_add.notified().await;
+                } else if event_kind == "free" {
+                    state.free_started.store(true, AtomicOrdering::SeqCst);
+                }
+                state.published.lock().unwrap().push(event_kind);
+                Ok(())
+            }
+        }
+
+        fn publish_load(&self, _load: ActiveLoad) {}
+
+        fn observe_load(
+            &self,
+            _worker: &WorkerWithDpRank,
+            _worker_type: &str,
+            _blocks: usize,
+            _tokens: usize,
+        ) {
         }
     }
 
@@ -2012,6 +2092,155 @@ mod tests {
         assert_eq!(
             sequences.active_request_counts().get(&worker).copied(),
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn replica_sync_free_before_add_does_not_resurrect_request() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _publisher) =
+            make_recording_sequences(HashMap::from([(1_u64, (0_u32, 1_u32))]));
+        let subscriber = VecSubscriber {
+            events: VecDeque::from(vec![
+                Ok(replica_free("req-reordered", worker)),
+                Ok(replica_add("req-reordered", worker, vec![1, 2, 3])),
+            ]),
+        };
+
+        sequences
+            .run_replica_sync(subscriber, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sequences
+                .request_index
+                .worker_for(&"req-reordered".to_string()),
+            None,
+            "a late Add must not resurrect a request after its Free was observed"
+        );
+        assert_eq!(
+            sequences.active_request_counts().get(&worker).copied(),
+            Some(0)
+        );
+        assert!(sequences.prompt_registry.is_block_index_empty());
+    }
+
+    #[tokio::test]
+    async fn replica_sync_replayed_add_after_free_does_not_resurrect_request() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _publisher) =
+            make_recording_sequences(HashMap::from([(1_u64, (0_u32, 1_u32))]));
+        let subscriber = VecSubscriber {
+            events: VecDeque::from(vec![
+                Ok(replica_add("req-replayed", worker, vec![1, 2, 3])),
+                Ok(replica_free("req-replayed", worker)),
+                Ok(replica_add("req-replayed", worker, vec![1, 2, 3])),
+            ]),
+        };
+
+        sequences
+            .run_replica_sync(subscriber, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sequences
+                .request_index
+                .worker_for(&"req-replayed".to_string()),
+            None,
+            "a replayed Add must not resurrect a request after Free"
+        );
+        assert_eq!(
+            sequences.active_request_counts().get(&worker).copied(),
+            Some(0)
+        );
+        assert!(sequences.prompt_registry.is_block_index_empty());
+    }
+
+    #[tokio::test]
+    async fn replica_publisher_preserves_per_request_lifecycle_order() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let state = Arc::new(BlockingAddPublisherState::default());
+        let sequences = ActiveSequencesMultiWorker::new(
+            BlockingAddPublisher {
+                state: Arc::clone(&state),
+            },
+            4,
+            HashMap::from([(worker.worker_id, (0_u32, 1_u32))]),
+            true,
+            7,
+            "test",
+        );
+
+        sequences
+            .add_request(
+                SequenceRequest {
+                    request_id: "req-publish-order".to_string(),
+                    token_sequence: Some(vec![1, 2, 3]),
+                    track_prefill_tokens: true,
+                    expected_output_tokens: None,
+                    prefill_load_hint: tracking_hint(12),
+                    worker,
+                    lora_name: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        state.add_started.notified().await;
+
+        sequences
+            .free(&"req-publish-order".to_string(), Instant::now())
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !state.free_started.load(AtomicOrdering::SeqCst),
+            "Free publish must not overtake an in-flight Add for the same request"
+        );
+
+        state.release_add.notify_one();
+        let published = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let published = state.published.lock().unwrap().clone();
+                if published.len() == 2 {
+                    break published;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordered lifecycle events were not published");
+        assert_eq!(published, vec!["add", "free"]);
+    }
+
+    #[tokio::test]
+    async fn replica_sync_mark_before_add_applies_pending_prefill_completion() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _publisher) =
+            make_recording_sequences(HashMap::from([(1_u64, (0_u32, 1_u32))]));
+        let subscriber = VecSubscriber {
+            events: VecDeque::from(vec![
+                Ok(replica_mark("req-reordered-mark", worker)),
+                Ok(replica_add("req-reordered-mark", worker, vec![1, 2, 3])),
+            ]),
+        };
+
+        sequences
+            .run_replica_sync(subscriber, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sequences.active_request_counts().get(&worker).copied(),
+            Some(1)
+        );
+        assert_eq!(
+            sequences
+                .active_tokens(Instant::now())
+                .get(&worker)
+                .copied(),
+            Some(0),
+            "a MarkPrefillCompleted received before Add must still clear prefill load"
         );
     }
 
