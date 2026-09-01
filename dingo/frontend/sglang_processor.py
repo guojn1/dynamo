@@ -50,6 +50,8 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SGLANG_STREAM_INTERVAL: int = 1
+
 # Internal carrier key mirroring the Rust constant in
 # lib/llm/src/protocols/openai/chat_completions.rs (INTERNAL_SGLEXT_KEY).
 # The Python processor stashes SGLang's cached_tokens_details under this key
@@ -822,7 +824,10 @@ class SglangEngineFactory:
         self.reasoning_parser_name = reasoning_parser_name
 
         self.trust_remote_code = config.trust_remote_code
-        self.stream_interval = 20
+        # Streaming is latency-sensitive by default. Buffering 20 decode tokens here
+        # turns a ~15 ms backend decode cadence into ~300 ms client-visible SSE ITL.
+        # Operators can still trade latency for fewer frontend writes via the env var.
+        self.stream_interval = DEFAULT_SGLANG_STREAM_INTERVAL
         raw_stream_interval = os.getenv("DYN_SGLANG_STREAM_INTERVAL")
         if raw_stream_interval:
             try:

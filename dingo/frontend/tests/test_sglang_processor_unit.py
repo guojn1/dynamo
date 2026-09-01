@@ -37,6 +37,7 @@ from dingo.frontend.sglang_prepost import (
     resolve_request_force_reasoning,
 )
 from dingo.frontend.sglang_processor import (
+    SglangEngineFactory,
     SglangPreprocessWorkerResult,
     SglangProcessor,
     _build_dynamo_preproc,
@@ -64,6 +65,40 @@ pytestmark = [
 ]
 
 MODEL = "Qwen/Qwen3-0.6B"
+
+
+class TestSglangEngineFactoryStreamInterval:
+    @staticmethod
+    def _config() -> types.SimpleNamespace:
+        return types.SimpleNamespace(trust_remote_code=False)
+
+    def test_stream_interval_defaults_to_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DYN_SGLANG_STREAM_INTERVAL", raising=False)
+
+        factory = SglangEngineFactory(self._config())
+
+        assert factory.stream_interval == 1
+
+    def test_stream_interval_env_override_is_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DYN_SGLANG_STREAM_INTERVAL", "20")
+
+        factory = SglangEngineFactory(self._config())
+
+        assert factory.stream_interval == 20
+
+    def test_invalid_stream_interval_uses_low_latency_default(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("DYN_SGLANG_STREAM_INTERVAL", "invalid")
+
+        factory = SglangEngineFactory(self._config())
+
+        assert factory.stream_interval == 1
+        assert "using default=1" in caplog.text
 
 
 @pytest.fixture(scope="module")
