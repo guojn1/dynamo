@@ -292,42 +292,53 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
         if let Some(worker) = pinned_worker {
             match eligibility.validate_worker_rank(workers, worker) {
-                Ok(_) => {}
-                Err(WorkerEligibilityError::WorkerOverloaded { .. }) => {
-                    return Err(KvSchedulerError::PinnedWorkerOverloaded {
-                        worker_id: worker.worker_id,
+                Ok(_) => {
+                    // Pinned worker is eligible — use it (normal affinity path)
+                    let min_active_prefill_tokens =
+                        request.worker_load_for(worker).active_prefill_tokens;
+                    let logit = self.worker_logit(
+                        request,
+                        worker,
+                        block_size,
+                        min_active_prefill_tokens,
+                        weights,
+                        "Pinned formula",
+                    );
+                    let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
+                    let cached_tokens = request.effective_cached_tokens_for(worker);
+
+                    tracing::info!(
+                        "Selected pinned worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
+                        self.worker_type,
+                        worker.worker_id,
+                        worker.dp_rank,
+                        logit,
+                        effective_overlap_blocks,
+                    );
+
+                    return Ok(WorkerSelectionResult {
+                        worker,
+                        required_blocks: request_blocks,
+                        effective_overlap_blocks,
+                        cached_tokens,
                     });
                 }
-                Err(_) => return Err(KvSchedulerError::NoEndpoints),
+                Err(WorkerEligibilityError::WorkerOverloaded { .. }) => {
+                    tracing::warn!(
+                        worker_id = worker.worker_id,
+                        "Pinned worker overloaded, falling back to KV-aware routing for this request"
+                    );
+                    // Fall through to normal KV routing below
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        worker_id = worker.worker_id,
+                        error = ?e,
+                        "Pinned worker unavailable, falling back to KV-aware routing for this request"
+                    );
+                    // Fall through to normal KV routing below
+                }
             }
-
-            let min_active_prefill_tokens = request.worker_load_for(worker).active_prefill_tokens;
-            let logit = self.worker_logit(
-                request,
-                worker,
-                block_size,
-                min_active_prefill_tokens,
-                weights,
-                "Pinned formula",
-            );
-            let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
-            let cached_tokens = request.effective_cached_tokens_for(worker);
-
-            tracing::info!(
-                "Selected pinned worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
-                self.worker_type,
-                worker.worker_id,
-                worker.dp_rank,
-                logit,
-                effective_overlap_blocks,
-            );
-
-            return Ok(WorkerSelectionResult {
-                worker,
-                required_blocks: request_blocks,
-                effective_overlap_blocks,
-                cached_tokens,
-            });
         }
 
         let temperature = request
@@ -782,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overloaded_pinned_worker_is_not_rerouted() {
+    fn test_overloaded_pinned_worker_falls_back_to_kv_routing() {
         use crate::test_utils::SimpleWorkerConfig;
 
         let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
@@ -792,6 +803,7 @@ mod tests {
         ]);
         let mut request = base_request(16);
         request.pinned_worker = Some(WorkerWithDpRank::from_worker_id(0));
+        // Only worker 0 is overloaded; worker 1 is healthy
         let overloaded_worker_ids = HashSet::from([0]);
 
         let result = selector.select_worker(
@@ -801,10 +813,11 @@ mod tests {
             16,
         );
 
-        assert!(matches!(
-            result,
-            Err(KvSchedulerError::PinnedWorkerOverloaded { worker_id: 0 })
-        ));
+        // Pinned worker 0 is overloaded → selector falls back to KV routing
+        // and selects the healthy worker 1 instead of returning an error.
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.worker.worker_id, 1);
     }
 
     #[test]

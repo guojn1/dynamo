@@ -48,7 +48,7 @@ use super::{
 use crate::{
     preprocessor::PreprocessedRequest,
     protocols::common::{
-        extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
+        extensions::{SESSION_AFFINITY_CONTEXT_KEY, SESSION_AFFINITY_METADATA_KEY, SessionAffinityId},
         timing::RequestPhase,
     },
 };
@@ -439,6 +439,24 @@ impl AffinityCoordinator {
         Ok(Some(*target))
     }
 
+    /// Invalidate the binding for a session: evicts the local cache entry and
+    /// closes the shared etcd claim (which broadcasts a `Delete` event to all
+    /// replicas). Used when a pinned worker is found unavailable and the router
+    /// falls back to KV-aware routing — the next request for this session will
+    /// create a fresh binding with a healthy worker.
+    pub(crate) async fn invalidate_binding(&self, session_id: &SessionAffinityId) {
+        let claim_key = self.inner.claims.key(session_id);
+        tracing::info!(
+            session_id = session_id.as_str(),
+            claim_key = %claim_key,
+            "Invalidating session affinity binding (pinned worker unavailable)"
+        );
+        // 1. Evict local cache entry (wakes any waiters on Initializing entries)
+        Self::evict_key(&self.inner, &claim_key);
+        // 2. Close the shared etcd claim → broadcasts ClaimEvent::Delete to all replicas
+        let _ = self.inner.claims.close(&claim_key).await;
+    }
+
     #[cfg(test)]
     pub(super) fn entry_count(&self) -> usize {
         self.inner.entry_count.load(Ordering::Relaxed)
@@ -801,9 +819,18 @@ impl Drop for AffinityTrackedStream {
 pub fn affinity_id(
     request: &dynamo_runtime::pipeline::SingleIn<PreprocessedRequest>,
 ) -> Result<Option<Arc<SessionAffinityId>>, Error> {
-    request
-        .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
-        .map_err(|message| invalid_argument(format!("invalid session affinity context: {message}")))
+    // Primary: typed context entry (works for pure-Rust request paths)
+    if let Ok(Some(id)) = request.get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY) {
+        return Ok(Some(id));
+    }
+    // Fallback: string metadata (survives wire protocol + PyO3 binding
+    // where typed Registry entries are not propagated)
+    if let Some(id_str) = request.metadata().get(SESSION_AFFINITY_METADATA_KEY) {
+        if !id_str.trim().is_empty() {
+            return Ok(Some(Arc::new(SessionAffinityId::new(id_str.clone()))));
+        }
+    }
+    Ok(None)
 }
 
 pub fn session_final(request: &PreprocessedRequest) -> bool {

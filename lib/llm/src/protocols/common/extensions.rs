@@ -269,6 +269,15 @@ pub const AGENT_CONTEXT_CONTEXT_KEY: &str = "dynamo.llm.agent_context";
 
 pub const SESSION_AFFINITY_CONTEXT_KEY: &str = "dynamo.llm.session_affinity";
 
+/// String metadata key for session affinity ID.
+///
+/// Fallback carrier that survives the wire protocol (HTTP→Python processor)
+/// and the PyO3 binding (Python→Rust), where typed Registry entries are not
+/// propagated. `context_from_headers` writes the session ID into both the
+/// typed entry and this metadata key; `affinity_id` reads the typed entry
+/// first and falls back to this metadata key.
+pub const SESSION_AFFINITY_METADATA_KEY: &str = "dynamo.session_affinity_id";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAffinityId(String);
 

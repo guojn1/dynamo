@@ -142,6 +142,78 @@ impl KvPushRouter {
             .map(|worker| (worker.worker_id, Some(worker.dp_rank)));
         let Some((pinned_worker_id, requested_dp_rank)) = affinity_pin.or(explicit_pin) else {
             let _nvtx_kv = dynamo_nvtx_range!("route.kv_match");
+            let t_start = std::time::Instant::now();
+            let selection = self
+                .select_best_match(BestMatchArgs {
+                    context_id,
+                    routing_parts,
+                    router_config_override: request.router_config_override.as_ref(),
+                    update_states: !is_query_only,
+                    return_routing_hashes,
+                    lora_name,
+                    priority_jump,
+                    strict_priority,
+                    policy_class: options.policy_class.clone(),
+                    expected_output_tokens,
+                    pinned_worker: None,
+                    allowed_worker_ids,
+                    routing_constraints: routing_constraints.clone(),
+                    scheduler_tracked: !is_query_only,
+                })
+                .await;
+            let t_elapsed_us = t_start.elapsed().as_micros();
+
+            let selection = selection?;
+
+            let total_blocks = routing_parts
+                .token_ids
+                .len()
+                .div_ceil(self.chooser.block_size() as usize);
+            tracing::info!(
+                request_id = %context_id,
+                worker_id = selection.instance_id,
+                dp_rank = selection.dp_rank,
+                overlap_blocks = selection.overlap_amount,
+                total_blocks,
+                elapsed_us = t_elapsed_us,
+                "ROUTE_TIMING: request_id={} worker={} overlap={}/{} blocks elapsed={}us",
+                context_id,
+                selection.instance_id,
+                selection.overlap_amount,
+                total_blocks,
+                t_elapsed_us,
+            );
+
+            return Ok(selection);
+        };
+
+        let pinned_worker = resolve_pinned_worker_rank(
+            pinned_worker_id,
+            requested_dp_rank,
+            self.chooser.unique_dp_rank_for_worker(pinned_worker_id),
+        )?;
+        let pinned_ineligible = {
+            let configs = self.chooser.workers_with_configs.borrow();
+            let eligibility = RoutingEligibility::new(
+                allowed_worker_ids.as_ref(),
+                None,
+                Some(pinned_worker),
+                &routing_constraints,
+            );
+            eligibility.validate_worker_rank(&configs, pinned_worker).err()
+        }; // configs dropped here, before any .await
+
+        if let Some(error) = pinned_ineligible {
+            tracing::warn!(
+                worker_id = pinned_worker.worker_id,
+                dp_rank = pinned_worker.dp_rank,
+                error = %error,
+                "Pinned worker unavailable, falling back to KV-aware routing for this request"
+            );
+            // Fall back to normal KV routing instead of returning an error.
+            // The caller (select_with_affinity) will detect that a different
+            // worker was selected and invalidate the stale binding.
+            let _nvtx_kv = dynamo_nvtx_range!("route.kv_match_fallback");
             let selection = self
                 .select_best_match(BestMatchArgs {
                     context_id,
@@ -160,50 +232,7 @@ impl KvPushRouter {
                     scheduler_tracked: !is_query_only,
                 })
                 .await?;
-
-            if !is_query_only {
-                let total_blocks = routing_parts
-                    .token_ids
-                    .len()
-                    .div_ceil(self.chooser.block_size() as usize);
-                // tests/utils/router_logs.py parses the structured fields on this event.
-                tracing::debug!(
-                    request_id = %context_id,
-                    worker_id = selection.instance_id,
-                    dp_rank = selection.dp_rank,
-                    overlap_blocks = selection.overlap_amount,
-                    total_blocks,
-                    "[ROUTING] Best: worker_{} dp_rank={} with {}/{} blocks overlap",
-                    selection.instance_id,
-                    selection.dp_rank,
-                    selection.overlap_amount,
-                    total_blocks,
-                );
-            }
-
             return Ok(selection);
-        };
-
-        let pinned_worker = resolve_pinned_worker_rank(
-            pinned_worker_id,
-            requested_dp_rank,
-            self.chooser.unique_dp_rank_for_worker(pinned_worker_id),
-        )?;
-        {
-            let configs = self.chooser.workers_with_configs.borrow();
-            let eligibility = RoutingEligibility::new(
-                allowed_worker_ids.as_ref(),
-                None,
-                Some(pinned_worker),
-                &routing_constraints,
-            );
-            if let Err(error) = eligibility.validate_worker_rank(&configs, pinned_worker) {
-                return Err(anyhow::anyhow!(
-                    "Pinned worker {} dp_rank {} is not eligible: {error}",
-                    pinned_worker.worker_id,
-                    pinned_worker.dp_rank
-                ));
-            }
         }
 
         tracing::debug!(

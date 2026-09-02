@@ -48,8 +48,9 @@ use super::{
 use crate::engines::ValidateRequest;
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
 use crate::protocols::common::extensions::{
-    AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
-    agent_context_from_headers, apply_header_routing_overrides, session_affinity_from_headers,
+    AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY,
+    SESSION_AFFINITY_METADATA_KEY, SessionAffinityId, agent_context_from_headers,
+    apply_header_routing_overrides, session_affinity_from_headers,
 };
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::{
@@ -544,14 +545,24 @@ fn context_from_headers<T: Send + Sync + 'static>(
     request_id: String,
     headers: &HeaderMap,
 ) -> Result<Context<T>, ErrorResponse> {
-    let metadata = extract_metadata_from_http(headers)
+    let mut metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
+    // Also write session affinity ID into string metadata so it survives the
+    // wire protocol (HTTP→Python processor) and the PyO3 binding (Python→Rust),
+    // where typed Registry entries are not propagated.
+    let session_affinity = session_affinity_from_headers(headers);
+    if let Some(ref id) = session_affinity {
+        metadata.insert(
+            SESSION_AFFINITY_METADATA_KEY.to_string(),
+            id.as_str().to_string(),
+        );
+    }
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
     attach_x_request_id(&mut request, headers);
     if let Some(agent_context) = agent_context_from_headers(headers) {
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);
     }
-    if let Some(session_affinity) = session_affinity_from_headers(headers) {
+    if let Some(session_affinity) = session_affinity {
         request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity);
     }
     Ok(request)

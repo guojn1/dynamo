@@ -170,6 +170,30 @@ impl KvPushRouter {
             .await?;
         let worker = affinity_worker(resolved.target());
         let selection = self.select_request(request, phase, false, worker).await?;
+
+        // Detect fallback: if a pinned worker was requested but the selector
+        // returned a different worker, the pinned worker was unavailable and
+        // the selector fell back to KV-aware routing. Invalidate the stale
+        // binding so the next request creates a fresh one with the new worker.
+        if let Some(ref pinned) = worker {
+            if selection.instance_id != pinned.worker_id {
+                tracing::warn!(
+                    pinned_worker_id = pinned.worker_id,
+                    actual_worker_id = selection.instance_id,
+                    session_id = %session_id.as_str(),
+                    "Pinned worker unavailable — fell back to KV-aware routing. \
+                     Invalidating stale binding; next request will rebind to the new worker."
+                );
+                // Release the current resolved affinity (drops the lease)
+                drop(resolved);
+                // Invalidate the stale binding (local cache + etcd claim)
+                affinity.invalidate_binding(&session_id).await;
+                // Return selection without a resolved affinity — the next request
+                // will acquire fresh and create a new binding.
+                return Ok((selection, None));
+            }
+        }
+
         Ok((selection, Some(resolved)))
     }
 
@@ -398,6 +422,12 @@ impl KvPushRouter {
         let mut guard = self
             .track_selection(&request, &mut selection, is_query_only)
             .await?;
+        // Extract session_id before dispatch consumes the request (time point 2 guard)
+        let affinity_session = self
+            .affinity
+            .as_ref()
+            .and_then(|_| affinity_id(&request).ok().flatten())
+            .map(|sid| (self.affinity.as_ref().unwrap(), sid));
         let target = AffinityTarget {
             worker_id: selection.instance_id,
             dp_rank: Some(selection.dp_rank),
@@ -410,9 +440,23 @@ impl KvPushRouter {
             }
         };
         drop(route_guard);
-        let stream = self
+        let stream = match self
             .dispatch_selection(request, selection, guard, true)
-            .await?;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                if let Some((affinity, session_id)) = affinity_session {
+                    tracing::warn!(
+                        error = %error,
+                        session_id = %session_id.as_str(),
+                        "Prefill dispatch failed — invalidating affinity binding so next request rebinds to a healthy worker"
+                    );
+                    affinity.invalidate_binding(&session_id).await;
+                }
+                return Err(error);
+            }
+        };
         let Some(operation) = operation else {
             return Ok((metadata, stream));
         };
@@ -507,10 +551,34 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         let guard = self
             .track_selection(&request, &mut selection, false)
             .await?;
+        // Extract session_id before dispatch consumes the request, so we can
+        // invalidate the affinity binding if dispatch fails (time point 2:
+        // worker crashes mid-dispatch). The current request may still fail,
+        // but clearing the binding ensures the next request rebinds to a
+        // healthy worker instead of retrying the dead one.
+        let affinity_session = self
+            .affinity
+            .as_ref()
+            .and_then(|_| affinity_id(&request).ok().flatten())
+            .map(|sid| (self.affinity.as_ref().unwrap(), sid));
         drop(route_guard);
-        let stream = self
+        let stream = match self
             .dispatch_selection(request, selection, guard, operation.is_some())
-            .await?;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                if let Some((affinity, session_id)) = affinity_session {
+                    tracing::warn!(
+                        error = %error,
+                        session_id = %session_id.as_str(),
+                        "Dispatch failed — invalidating affinity binding so next request rebinds to a healthy worker"
+                    );
+                    affinity.invalidate_binding(&session_id).await;
+                }
+                return Err(error);
+            }
+        };
         match operation {
             Some(operation) => Ok(operation.into_stream(stream, close_on_finish)),
             None => Ok(stream),
