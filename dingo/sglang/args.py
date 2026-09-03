@@ -15,7 +15,15 @@ from typing import Any, Dict, Generator, Optional
 
 import yaml
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+# The sglang upstream moved `server_args_config_parser` into
+# `sglang/srt/utils/` between image builds (mutable `lmsysorg/sglang`
+# base-image tags re-pin silently). Import whichever layout this runtime
+# ships so the same dingo image works across both sglang revisions.
+try:
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+except ImportError:  # pragma: no cover - depends on the sglang build
+    from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
 from dingo.common.config_dump import register_encoder
 from dingo.common.configuration.groups import DynamoRuntimeConfig
