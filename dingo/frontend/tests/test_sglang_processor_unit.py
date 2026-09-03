@@ -2533,6 +2533,61 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
         assert "<|" not in delta["reasoning_content"]
 
 
+class TestReasoningTokenAccounting:  # FRONTEND.9 — thinking-token count for usage
+    """`pop_reasoning_token_count` aggregates tokens attributed to reasoning."""
+
+    class _Tokenizer:
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+            # Token 4 decodes with the reasoning-end marker; the sliding
+            # window makes it appear in that batch's delta text.
+            return "".join(")" if tid == 4 else chr(64 + tid) for tid in token_ids)
+
+    class _SplitParser:
+        """Yields reasoning until the marker, then everything is content."""
+
+        MARKER = ")"
+
+        def __init__(self) -> None:
+            self._done = False
+
+        def parse_stream_chunk(self, text: str) -> tuple[str, str]:
+            if self._done:
+                return "", text
+            if self.MARKER in text:
+                before, after = text.split(self.MARKER, 1)
+                self._done = True
+                return before, after
+            return text, ""
+
+    def test_reasoning_then_content_tokens_counted_separately(self):
+        post = SglangStreamingPostProcessor(
+            tokenizer=self._Tokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=self._SplitParser(),
+        )
+        # tokens 1-3 → reasoning, token 4 carries the boundary marker,
+        # token 5 → content.
+        post.process_output({"token_ids": [1, 2, 3], "finish_reason": None})
+        post.process_output({"token_ids": [4], "finish_reason": None})
+        post.process_output({"token_ids": [5], "finish_reason": "stop"})
+
+        assert post.pop_reasoning_token_count() == 4
+        assert post.pop_reasoning_token_count() is None
+
+    def test_plain_content_yields_no_reasoning_count(self):
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        rp = ReasoningParser(model_type="qwen3", stream_reasoning=True)
+        post = SglangStreamingPostProcessor(
+            tokenizer=self._Tokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=rp,
+        )
+        post.process_output({"token_ids": [1, 2], "finish_reason": "stop"})
+
+        assert post.pop_reasoning_token_count() is None
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------

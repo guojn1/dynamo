@@ -741,6 +741,21 @@ class SglangProcessor:
                             "model": request["model"],
                             "object": "chat.completion.chunk",
                         }
+                        # On the terminal chunk, surface the thinking-token
+                        # count the post-processor accumulated, so clients
+                        # can verify billing the same way as on the official
+                        # GLM API. Only fill in when the engine did not
+                        # already report its own completion details.
+                        if (
+                            finish_reason
+                            and pending_usage
+                            and "completion_tokens_details" not in pending_usage
+                        ):
+                            reasoning_tokens = post.pop_reasoning_token_count()
+                            if reasoning_tokens is not None:
+                                pending_usage["completion_tokens_details"] = {
+                                    "reasoning_tokens": reasoning_tokens
+                                }
                         if pending_usage:
                             dynamo_out["usage"] = pending_usage
                             pending_usage = None

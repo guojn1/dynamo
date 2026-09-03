@@ -341,10 +341,28 @@ enum OpenAiThinkingMode {
 }
 
 fn is_glm53_model_id(model: &str) -> bool {
-    model
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case("glm-5.3"))
+    model.rsplit('/').next().is_some_and(|name| {
+        // Compare on a normalized form so the alias-family deployed model ids
+        // (`glm-5.3`, `glm5.3`, `GLM_5.3`) match; version suffix must stay
+        // exact — `glm53` without the dot must NOT match.
+        let normalized = name
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "");
+        normalized == "glm5.3"
+    })
+}
+
+#[cfg(test)]
+mod glm53_model_id_tests {
+    #[test]
+    fn recognize_glm53_aliases() {
+        for id in ["glm-5.3", "glm5.3", "GLM-5.3", "GLM_5.3", "org/glm5.3"] {
+            assert!(super::is_glm53_model_id(id), "{id} should match");
+        }
+        for id in ["glm-5.2", "glm53", "glm-51", ""] {
+            assert!(!super::is_glm53_model_id(id), "{id} must not match");
+        }
+    }
 }
 
 fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<OpenAiThinkingMode>> {

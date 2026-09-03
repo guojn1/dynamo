@@ -1055,6 +1055,12 @@ class SglangStreamingPostProcessor:
         # arrive together, later calls may not be detected during streaming.
         # We accumulate all text fed to the parser and, on finish, re-parse
         # the full text to recover any missed tool calls or arguments.
+        # Token count attributed to reasoning_content. Tokens are counted
+        # per process_output batch: every token of a chunk whose delta
+        # carries reasoning_content counts toward thinking; the `` token
+        # can misattribute at most a handful of tokens on the single
+        # boundary chunk.
+        self._reasoning_token_count = 0
         self._tool_call_ids: dict[int, str] = {}  # tool_index -> call_id
         self._tool_call_names: dict[int, str] = {}  # tool_index -> name
         self._tool_call_args: dict[int, list[str]] = {}  # tool_index -> arg chunks
@@ -1069,6 +1075,17 @@ class SglangStreamingPostProcessor:
         while token_ids and token_ids[-1] in self._eos_token_ids:
             token_ids.pop()
         return token_ids
+
+
+    def pop_reasoning_token_count(self) -> int | None:
+        """Consume the reasoning token count accumulated across the stream.
+
+        Returns ``None`` when the reasoning parser never claimed any tokens
+        (plain-text response); otherwise the count of generated tokens
+        """
+        count = self._reasoning_token_count
+        self._reasoning_token_count = 0
+        return count if count > 0 else None
 
     def _tool_call_id(self, name: str, index: int) -> str:
         return _tool_call_id_for_parser(
@@ -1202,11 +1219,18 @@ class SglangStreamingPostProcessor:
         # -- Reasoning parsing --
         reasoning_text = None
         normal_text = delta_text
-
         if self.reasoning_parser and delta_text:
             r_text, n_text = self.reasoning_parser.parse_stream_chunk(delta_text)
             reasoning_text = r_text or None
             normal_text = n_text or ""
+            if reasoning_text:
+                self._reasoning_token_count += len(token_ids)
+            elif normal_text and not self._saw_normal_output:
+                # First content after thinking: that chunk's tokens include
+                # the reasoning-end marker (the parser consumed it as text),
+                # and at stream_interval=1 it is exactly the closing tag.
+                # Attribute the transition chunk to thinking.
+                self._reasoning_token_count += len(token_ids)
         if self._is_kimi_k3:
             reasoning_text = _strip_kimi_k3_control_markers(reasoning_text) or None
 

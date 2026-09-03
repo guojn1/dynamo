@@ -273,6 +273,14 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
                 self.usage.prompt_tokens_details = Some(prompt_details.clone());
             }
+
+            // Propagate completion token details if provided, including
+            // reasoning tokens (upstream fix #11027).
+            if let Some(completion_details) =
+                completion_usage.completion_tokens_details.as_ref()
+            {
+                self.usage.completion_tokens_details = Some(completion_details.clone());
+            }
         }
 
         let logprobs = self.create_logprobs(
