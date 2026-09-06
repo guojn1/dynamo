@@ -135,7 +135,7 @@ pub fn split_sglext(
 /// - `common`: Common extension fields (ignore_eos, min_tokens) at root level, embedded using `serde(flatten)`.
 /// - `nvext`: The optional NVIDIA extension field. See [`NvExt`] for more details.
 ///   Note: If ignore_eos is specified in both common and nvext, the common (root-level) value takes precedence.
-#[derive(ToSchema, Serialize, Validate, Debug, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
 pub struct NvCreateChatCompletionRequest {
     #[serde(flatten)]
     #[schema(value_type = Object)]
@@ -331,94 +331,6 @@ impl NvCreateChatCompletionRequest {
             .map_err(|_| anyhow::anyhow!("`stop_sequences` must be an array of strings"))?;
         self.inner.stop = Some(dynamo_protocols::types::Stop::StringArray(stop_sequences));
         Ok(())
-    }
-}
-
-/// Pre-process raw JSON to extract `thinking` content blocks from assistant
-/// messages and convert them to `reasoning_content` fields.
-///
-/// Upstream gateways (e.g. nexus) that translate Anthropic `/v1/messages` to
-/// OpenAI `/v1/chat/completions` may forward `{"type":"thinking",...}` content
-/// blocks verbatim. The OpenAI `ChatCompletionRequestAssistantMessageContent`
-/// type only supports `text` and `refusal` block variants, so deserialization
-/// fails with a 400 error. This function strips thinking blocks from the
-/// content array and promotes their text to the `reasoning_content` field on
-/// the assistant message, matching the behaviour of dynamo's own Anthropic
-/// conversion layer (`protocols/anthropic/types.rs:convert_assistant_blocks`).
-fn strip_thinking_blocks(value: &mut serde_json::Value) {
-    let Some(messages) = value
-        .get_mut("messages")
-        .and_then(|m| m.as_array_mut())
-    else {
-        return;
-    };
-
-    for msg in messages.iter_mut() {
-        // Only assistant messages carry thinking blocks
-        let is_assistant = msg
-            .get("role")
-            .and_then(|r| r.as_str())
-            .is_some_and(|r| r == "assistant");
-        if !is_assistant {
-            continue;
-        }
-
-        let Some(content_arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-
-        let mut thinking_text = Vec::new();
-        let mut non_thinking_blocks = Vec::new();
-
-        for block in content_arr.drain(..) {
-            let block_type = block
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
-            if block_type == "thinking" {
-                if let Some(text) = block.get("thinking").and_then(|t| t.as_str()) {
-                    thinking_text.push(text.to_string());
-                }
-            } else {
-                non_thinking_blocks.push(block);
-            }
-        }
-
-        // Replace content with non-thinking blocks only
-        if non_thinking_blocks.is_empty() {
-            // All blocks were thinking — set content to empty string
-            msg["content"] = serde_json::Value::String(String::new());
-        } else if non_thinking_blocks.len() == 1 {
-            // Single text block — simplify to string
-            if let Some(text) = non_thinking_blocks[0]
-                .get("text")
-                .and_then(|t| t.as_str())
-            {
-                msg["content"] = serde_json::Value::String(text.to_string());
-            } else {
-                msg["content"] = serde_json::Value::Array(non_thinking_blocks);
-            }
-        } else {
-            msg["content"] = serde_json::Value::Array(non_thinking_blocks);
-        }
-
-        // Promote thinking text to reasoning_content
-        if !thinking_text.is_empty() {
-            msg["reasoning_content"] = serde_json::Value::String(thinking_text.join("\n"));
-        }
-    }
-}
-
-/// Custom deserializer for `NvCreateChatCompletionRequest` that pre-processes
-/// thinking content blocks before delegating to the default derive impl.
-impl<'de> serde::Deserialize<'de> for NvCreateChatCompletionRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        strip_thinking_blocks(&mut value);
-        serde_json::from_value(value).map_err(serde::de::Error::custom)
     }
 }
 
