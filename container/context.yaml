@@ -27,6 +27,12 @@ dynamo:
   planner_runtime_image: nvcr.io/nvidia/distroless/python
   planner_runtime_image_tag: 3.12-v4.0.3
   python_version: "3.12"
+  # Pin the manylinux builder instead of following the mutable `latest` tag.
+  # Keep the same dated tag for x86_64 and aarch64.
+  manylinux_image_tag: "2026.09.05-1"
+  manylinux_image_digest:
+    x86_64: sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    aarch64: sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
 
   nats_version: v2.10.28
   etcd_version: v3.5.30

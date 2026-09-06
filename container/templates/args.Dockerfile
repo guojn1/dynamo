@@ -40,7 +40,7 @@ ARG WHEEL_BUILDER_IMAGE=${BASE_IMAGE}:${BASE_IMAGE_TAG}
 {# Multi-arch: manylinux selection is handled via --platform-pinned stage aliases   #}
 {# in wheel_builder.Dockerfile using TARGETARCH. No static ARG needed here.         #}
 {% else %}
-ARG WHEEL_BUILDER_IMAGE=quay.io/pypa/manylinux_2_28_{{ "x86_64" if platform == "amd64" else "aarch64" }}
+ARG WHEEL_BUILDER_IMAGE=quay.io/pypa/manylinux_2_28_{{ "x86_64" if platform == "amd64" else "aarch64" }}:{{ context.dynamo.manylinux_image_tag }}@{{ context.dynamo.manylinux_image_digest["x86_64" if platform == "amd64" else "aarch64"] }}
 {% endif %}
 
 # Build configuration

@@ -20,8 +20,8 @@ FROM {{ builder_image }} AS wheel_builder_base
 # always pulled as the correct native arch regardless of the current TARGETPLATFORM.
 # BuildKit only fetches and builds the stage that TARGETARCH resolves to; the other
 # is a no-op for each sub-build.
-FROM --platform=linux/amd64 quay.io/pypa/manylinux_2_28_x86_64 AS manylinux_amd64
-FROM --platform=linux/arm64 quay.io/pypa/manylinux_2_28_aarch64 AS manylinux_arm64
+FROM --platform=linux/amd64 quay.io/pypa/manylinux_2_28_x86_64:{{ context.dynamo.manylinux_image_tag }}@{{ context.dynamo.manylinux_image_digest.x86_64 }} AS manylinux_amd64
+FROM --platform=linux/arm64 quay.io/pypa/manylinux_2_28_aarch64:{{ context.dynamo.manylinux_image_tag }}@{{ context.dynamo.manylinux_image_digest.aarch64 }} AS manylinux_arm64
 {% endif %}
 
 ##################################
@@ -138,10 +138,44 @@ RUN apt-get update -y \
 # --setopt=tsflags=nocontexts: skip SELinux file-context labeling. The manylinux
 # image lacks the SELinux policy store that some compute nodes expect; without
 # this flag, dnf fails with "ValueError: SELinux policy is not managed".
+# Avoid the public mirrorlist in CI: TLS interception can terminate its handshake
+# before package downloads start. Use the same fixed Huawei Cloud mirror as the
+# self-hosted runner, including EPEL (needed by dkms), and retry transient errors.
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
-    dnf install -y --setopt=tsflags=nocontexts almalinux-release-synergy && \
-    dnf config-manager --set-enabled powertools && \
-    dnf install -y --setopt=tsflags=nocontexts \
+    set -eux; \
+    configure_dnf_repos() { \
+        sed -i \
+            -e 's|^mirrorlist=|# mirrorlist=|' \
+            -e 's|^# *baseurl=https://repo\.almalinux\.org/|baseurl=https://repo.huaweicloud.com/|' \
+            -e 's|^# *baseurl=http://repo\.almalinux\.org/|baseurl=https://repo.huaweicloud.com/|' \
+            -e 's|^baseurl=https://repo\.almalinux\.org/|baseurl=https://repo.huaweicloud.com/|' \
+            -e 's|^baseurl=http://repo\.almalinux\.org/|baseurl=https://repo.huaweicloud.com/|' \
+            /etc/yum.repos.d/almalinux*.repo; \
+        for repo_file in /etc/yum.repos.d/epel*.repo; do \
+            [ -e "${repo_file}" ] || continue; \
+            sed -i \
+                -e 's|^metalink=|# metalink=|' \
+                -e 's|^# *baseurl=https://download\.example/pub/epel/|baseurl=https://repo.huaweicloud.com/epel/|' \
+                -e 's|^# *baseurl=http://download\.example/pub/epel/|baseurl=https://repo.huaweicloud.com/epel/|' \
+                -e 's|^baseurl=https://download\.fedoraproject\.org/pub/epel/|baseurl=https://repo.huaweicloud.com/epel/|' \
+                -e 's|^baseurl=http://download\.fedoraproject\.org/pub/epel/|baseurl=https://repo.huaweicloud.com/epel/|' \
+                "${repo_file}"; \
+        done; \
+    }; \
+    configure_dnf_repos; \
+    for attempt in 1 2 3 4 5; do \
+        if dnf install -y --setopt=tsflags=nocontexts almalinux-release-synergy; then \
+            break; \
+        fi; \
+        dnf clean metadata; \
+        if [ "${attempt}" -eq 5 ]; then exit 1; fi; \
+        echo "Synergy repository install attempt ${attempt} failed; retrying..." >&2; \
+        sleep $((attempt * 3)); \
+    done; \
+    configure_dnf_repos; \
+    dnf config-manager --set-enabled powertools; \
+    for attempt in 1 2 3 4 5; do \
+        if dnf install -y --setopt=tsflags=nocontexts \
         # Autotools (required for UCX, libfabric ./autogen.sh and ./configure)
         autoconf \
         automake \
@@ -177,7 +211,14 @@ RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
         libcurl-devel \
         openssl-devel \
         libuuid-devel \
-        zlib-devel
+        zlib-devel; then \
+            break; \
+        fi; \
+        dnf clean metadata; \
+        if [ "${attempt}" -eq 5 ]; then exit 1; fi; \
+        echo "System dependency install attempt ${attempt} failed; retrying..." >&2; \
+        sleep $((attempt * 3)); \
+    done
 
 # Default comes from context.yaml; keep it in sync with upstream NIXL's
 # contrib/Dockerfile.manylinux. NIXL v1.0.x needs newer hwloc than RHEL8 ships.
@@ -328,10 +369,6 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     apt-get update -y && apt-get install -y build-essential pkg-config xz-utils git yasm; \
     apt-get clean && rm -rf /var/lib/apt/lists/*; \
     elif [ "$DEVICE" = "cuda" ]; then \
-    sed -i \
-        -e 's|^mirrorlist=|# mirrorlist=|' \
-        -e 's|^# baseurl=https://repo.almalinux.org/|baseurl=http://repo.almalinux.org/|' \
-        /etc/yum.repos.d/almalinux*.repo; \
     for attempt in 1 2 3 4 5; do \
         if dnf install -y --disablerepo='epel*' --setopt=tsflags=nocontexts \
             pkg-config xz git yasm; then \
