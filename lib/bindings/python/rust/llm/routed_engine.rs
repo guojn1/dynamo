@@ -3,14 +3,25 @@
 
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 use dynamo_llm::entrypoint::PrefillRoutedEngine;
 use dynamo_llm::protocols::common::preprocessor::PreprocessedRequest;
+use dynamo_llm::protocols::common::timing::RequestTracker;
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 
 use crate::to_pyerr;
+
+fn ensure_request_tracker(request: &mut PreprocessedRequest) {
+    // `PreprocessedRequest::tracker` is intentionally skipped by serde, so it cannot
+    // survive the Python dict -> Rust request boundary. Create a process-local tracker
+    // before routing so KV hit rate and response timing metrics are observed.
+    request
+        .tracker
+        .get_or_insert_with(|| Arc::new(RequestTracker::new()));
+}
 
 #[pyclass]
 pub struct RoutedEngine {
@@ -33,7 +44,9 @@ impl RoutedEngine {
         preprocessed: PyObject,
         context: Option<crate::context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let request: PreprocessedRequest = depythonize(preprocessed.bind(py)).map_err(to_pyerr)?;
+        let mut request: PreprocessedRequest =
+            depythonize(preprocessed.bind(py)).map_err(to_pyerr)?;
+        ensure_request_tracker(&mut request);
         let request_context = if let Some(parent_context) = context.as_ref() {
             let parent_metadata = parent_context.metadata_snapshot();
             let parent_context = parent_context.inner();
@@ -91,5 +104,49 @@ impl RoutedEngine {
 
             Ok(crate::AsyncResponseStream::new(rx, true))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_llm::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+
+    fn request_with_tracker() -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("test".to_string())
+            .token_ids(vec![1, 2, 3])
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default())
+            .tracker(Some(Arc::new(RequestTracker::new())))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn restores_tracker_after_serde_boundary() {
+        let serialized = serde_json::to_value(request_with_tracker()).unwrap();
+        let mut request: PreprocessedRequest = serde_json::from_value(serialized).unwrap();
+
+        assert!(request.tracker.is_none());
+        ensure_request_tracker(&mut request);
+        assert!(request.tracker.is_some());
+    }
+
+    #[test]
+    fn preserves_existing_tracker() {
+        let mut request = request_with_tracker();
+        let tracker = request.tracker.as_ref().unwrap().clone();
+
+        ensure_request_tracker(&mut request);
+
+        assert!(Arc::ptr_eq(
+            &tracker,
+            request
+                .tracker
+                .as_ref()
+                .expect("tracker should remain attached")
+        ));
     }
 }

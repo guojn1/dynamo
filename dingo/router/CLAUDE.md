@@ -83,9 +83,11 @@ logic but do not share the same serialization, RPC, or process boundaries.
 
 - Never assume `RequestTracker` crosses a Python or process boundary.
   `PreprocessedRequest.tracker` is `#[serde(skip)]`, so the Python chat
-  processor path does not preserve it when `RoutedEngine` deserializes a dict.
-  Standalone and custom routers also cannot carry the `Arc<RequestTracker>`
-  across Rust -> Python -> Rust or RPC boundaries automatically.
+  processor path cannot preserve an upstream tracker when `RoutedEngine`
+  deserializes a dict. `RoutedEngine` attaches a new process-local tracker
+  before embedded routing so router metrics remain available. Standalone and
+  custom routers also cannot carry the `Arc<RequestTracker>` across Rust ->
+  Python -> Rust or RPC boundaries automatically.
 
 - If downstream timing must reach the frontend, transport a snapshot
   explicitly in the response data and merge it into the frontend-owned
